@@ -1,0 +1,14 @@
+name = "personal-agent"
+main = "src/index.ts"
+compatibility_date = "2024-09-25"
+
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "personal-agent-db"
+database_id = "45883f58-45db-458c-9d78-304f06cbf0f1"
+
+[ai]
+binding = "AI"
