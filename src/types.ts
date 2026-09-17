@@ -27,7 +27,9 @@ export interface TelegramMessage {
   date: number;
 }
 
-export type ItemType = 'task' | 'note' | 'idea' | 'reminder' | 'inbox';
+export type ItemType = 'task' | 'goal' | 'idea' | 'reminder' | 'inbox';
+
+export type RepeatFreq = 'daily' | 'weekly';
 
 export interface ClassificationResult {
   type: ItemType;
@@ -37,6 +39,8 @@ export interface ClassificationResult {
   due_at: string | null;
   tags: string[];
   confidence: number;
+  repeat_freq: RepeatFreq | null;
+  repeat_count: number | null;
 }
 
 export interface RawMessage {
@@ -62,4 +66,7 @@ export interface Item {
   created_at: string;
   completed_at: string | null;
   notified_at: string | null;
+  repeat_freq: RepeatFreq | null;
+  repeat_remaining: number | null;
+  repeat_total: number | null;
 }
