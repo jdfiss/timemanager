@@ -41,6 +41,7 @@ export interface ClassificationResult {
   confidence: number;
   repeat_freq: RepeatFreq | null;
   repeat_count: number | null;
+  time_issue: string | null;
 }
 
 export interface RawMessage {

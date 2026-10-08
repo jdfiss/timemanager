@@ -1,6 +1,6 @@
 import { Env, Item } from './types';
 import { sendMessage } from './telegram';
-import { addInterval, formatTaipei } from './timeparse';
+import { addInterval, formatTaipei, rollToTaipeiDate } from './timeparse';
 
 const TYPE_EMOJI: Record<string, string> = {
   task: '✅', goal: '🎯', idea: '💡', reminder: '🔔', inbox: '📥',
@@ -10,7 +10,7 @@ export async function checkReminders(env: Env): Promise<void> {
   const now = new Date().toISOString();
 
   // 時間到（reminder 的 remind_at 或 task/goal 的 due_at）且還沒處理過的，一次跳出
-  // 完成／延期一天／刪除 三個按鈕，讓使用者當場決定，不會默默消失也不會默默順延。
+  // 完成／刪除 按鈕；沒按就當作沒完成，隔天早上由 rolloverUnfinished 排入當天。
   const { results: due } = await env.DB.prepare(
     `SELECT * FROM items
      WHERE status = 'active'
@@ -37,7 +37,6 @@ export async function checkReminders(env: Env): Promise<void> {
     await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, msg, [
       [
         { text: '✅ 完成', callback_data: `done:${item.id}` },
-        { text: '📅 延期一天', callback_data: `postpone:${item.id}` },
         { text: '🗑 刪除', callback_data: `delete:${item.id}` },
       ],
     ]);
@@ -127,6 +126,34 @@ export async function postponeItem(env: Env, itemId: number): Promise<string | n
   }
 
   return `📅 #${itemId} 已延到 ${formatTaipei(nextAt)}`;
+}
+
+/**
+ * 未完成事項排入今天：時間點（remind_at 或 due_at）落在今天（台北）之前、還沒完成／刪除的，
+ * 保留原本時分、日期移到今天，狀態回到 active，時間到會再跳一次按鈕。回傳被順延的項目。
+ */
+export async function rolloverUnfinished(env: Env, todayTaipei: string): Promise<Item[]> {
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM items
+     WHERE status IN ('active', 'notified')
+     AND (remind_at IS NOT NULL OR due_at IS NOT NULL)`
+  ).all<Item>();
+
+  const rolled: Item[] = [];
+  for (const item of results) {
+    const remindAt = item.remind_at ? rollToTaipeiDate(item.remind_at, todayTaipei) : null;
+    const dueAt = item.due_at ? rollToTaipeiDate(item.due_at, todayTaipei) : null;
+    if (!remindAt && !dueAt) continue;
+
+    const next = { remind_at: remindAt ?? item.remind_at, due_at: dueAt ?? item.due_at };
+    await env.DB.prepare(
+      `UPDATE items SET status = 'active', notified_at = NULL, remind_at = ?, due_at = ? WHERE id = ?`
+    )
+      .bind(next.remind_at, next.due_at, item.id)
+      .run();
+    rolled.push({ ...item, ...next, status: 'active', notified_at: null });
+  }
+  return rolled;
 }
 
 async function getChatId(env: Env, rawMessageId: number | null): Promise<number | null> {

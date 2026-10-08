@@ -63,13 +63,14 @@ export default {
 
     const chatId = message.chat.id;
     const text = message.text.trim();
+    const messageTime = new Date(message.date * 1000).toISOString();
 
     if (text.startsWith('/')) {
-      await handleCommand(env, chatId, text);
+      await handleCommand(env, chatId, text, messageTime);
       return new Response('ok');
     }
 
-    await processMessage(env, chatId, message.message_id, message.from!.id, text);
+    await processMessage(env, chatId, message.message_id, message.from!.id, text, message.date);
     return new Response('ok');
   },
 
@@ -176,7 +177,18 @@ async function handleCallback(
     } else {
       const emoji = TYPE_EMOJI[newType] || '📄';
       await answerCallbackQuery(env.TELEGRAM_BOT_TOKEN, callbackId, `${emoji} 已分類為 ${newType}`);
-      await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `${emoji} 項目 #${itemId} 已重新分類為 *${newType}*`);
+      let msg = `${emoji} 項目 #${itemId} 已重新分類為 *${newType}*`;
+      if (newType === 'reminder') {
+        const item = await env.DB.prepare(
+          `SELECT remind_at FROM items WHERE id = ?`
+        ).bind(itemId).first<{ remind_at: string | null }>();
+        if (item?.remind_at) {
+          msg += `\n⏰ 將在 ${formatTaipei(item.remind_at)} 提醒你`;
+        } else {
+          msg += `\n⚠️ 沒有偵測到明確時間，不會發出提醒。用 /remind ${itemId} <時間> 設定，例如 /remind ${itemId} 明天下午3點`;
+        }
+      }
+      await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, msg);
     }
     return;
   }
@@ -189,21 +201,23 @@ async function processMessage(
   chatId: number,
   messageId: number,
   userId: number,
-  text: string
+  text: string,
+  messageDateSeconds: number,
 ): Promise<void> {
-  const now = new Date().toISOString();
+  // Relative expressions must use the time the user sent the message, not processing/retry time.
+  const messageTime = new Date(messageDateSeconds * 1000).toISOString();
 
   const rawResult = await env.DB.prepare(
     `INSERT INTO raw_messages (telegram_message_id, user_id, raw_text, created_at, processing_status)
      VALUES (?, ?, ?, ?, 'pending')`
   )
-    .bind(messageId, userId, text, now)
+    .bind(messageId, userId, text, messageTime)
     .run();
 
   const rawId = rawResult.meta.last_row_id;
 
   try {
-    const result = await classify(env, text);
+    const result = await classify(env, text, messageTime);
 
     const similar = await findSimilarItems(env, result, text);
 
@@ -222,7 +236,7 @@ async function processMessage(
         result.remind_at,
         JSON.stringify(result.tags),
         result.confidence,
-        now,
+        messageTime,
         result.repeat_freq,
         result.repeat_count,
         result.repeat_count
@@ -239,8 +253,17 @@ async function processMessage(
 
     const e = TYPE_EMOJI[saveType] || '📄';
     let reply = `${e} 已記錄：${result.title}`;
+    if (result.content && result.content !== result.title) {
+      reply += `\n📝 ${result.content}`;
+    }
     if (result.remind_at) {
       reply += `\n⏰ 將在 ${formatTaipei(result.remind_at)} 提醒你`;
+    }
+    if (result.due_at) {
+      reply += `\n📅 截止時間：${formatTaipei(result.due_at)}`;
+    }
+    if (result.time_issue) {
+      reply += `\n⚠️ ${result.time_issue}，請用 /remind ${itemId} <明確時間> 補充`;
     }
     if (result.repeat_freq) {
       const freqLabel = result.repeat_freq === 'daily' ? '每天' : '每週';
@@ -284,14 +307,16 @@ async function retryPending(env: Env): Promise<void> {
 
   for (const row of results) {
     try {
-      const result = await classify(env, row.raw_text);
+      // Keep the original message timestamp so retries cannot move relative dates.
+      const result = await classify(env, row.raw_text, row.created_at);
+      const saveType = result.confidence < CONFIDENCE_THRESHOLD ? 'inbox' : result.type;
       await env.DB.prepare(
         `INSERT INTO items (raw_message_id, type, title, content, status, due_at, remind_at, tags, confidence, created_at, repeat_freq, repeat_remaining, repeat_total)
          VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)`
       )
         .bind(
           row.id,
-          result.type,
+          saveType,
           result.title,
           result.content,
           result.due_at,

@@ -1,5 +1,6 @@
-import { Env, ClassificationResult } from './types';
-import { applyFixedTimeOfDay, parseRepeatHint } from './timeparse';
+import type { Env, ClassificationResult } from './types';
+import { parseRepeatHint } from './timeparse';
+import { parseTimeIntent } from './time-intent';
 
 const SYSTEM_PROMPT = `你是一個個人記事分類助手。根據使用者的訊息，判斷它屬於哪種類型並提取結構化資訊。
 
@@ -7,9 +8,6 @@ const SYSTEM_PROMPT = `你是一個個人記事分類助手。根據使用者的
 {
   "type": "task" | "goal" | "idea" | "reminder" | "inbox",
   "title": "簡短標題（10字以內）",
-  "content": "完整內容描述",
-  "remind_at": "ISO 8601 格式的提醒時間，沒有則 null",
-  "due_at": "ISO 8601 格式的截止時間，沒有則 null",
   "tags": ["相關標籤"],
   "confidence": 0.0到1.0的信心度,
   "repeat_freq": "daily" | "weekly" | null，訊息裡有「每天/每日」或「每週/每星期/每禮拜」等重複意圖才填，否則 null,
@@ -23,10 +21,7 @@ const SYSTEM_PROMPT = `你是一個個人記事分類助手。根據使用者的
 - idea：靈感、想法、假設（「我覺得」「可能可以」「如果」「有個想法」）
 - inbox：無法判斷以上任何類型
 
-判斷 remind_at / due_at 的日期時，若訊息只講模糊時段詞、沒有明確數字時間，請一律套用以下固定對照表（同一個詞永遠對應同一個時刻，不要自己猜）：
-凌晨=01:00、早上/早晨/上午=08:00、中午/午間=12:00、下午=15:00、傍晚/黃昏=18:00、晚上/晚間=20:00、睡前/深夜=23:00。
-只講「明天」「後天」之類的日期、完全沒提時段時，用 08:00。
-如果訊息有明確數字（例如「15:00」「下午3點」「9點半」），直接用該數字，不要套用對照表。
+不要計算、猜測或回傳任何日期時間；時間會由獨立的規則解析器處理。
 
 如果不確定分類，就設 confidence 為低值（0.3 以下），讓使用者自己選。
 
@@ -34,19 +29,23 @@ const SYSTEM_PROMPT = `你是一個個人記事分類助手。根據使用者的
 
 export async function classify(
   env: Env,
-  text: string
+  text: string,
+  nowIso = new Date().toISOString(),
 ): Promise<ClassificationResult> {
-  const now = new Date().toISOString();
-
-  const response = await env.AI.run('@cf/meta/llama-3.2-3b-instruct', {
-    messages: [
-      { role: 'system', content: SYSTEM_PROMPT },
-      {
-        role: 'user',
-        content: `現在時間：${now}\n\n使用者訊息：${text}`,
-      },
-    ],
-  });
+  let response: unknown;
+  try {
+    response = await env.AI.run('@cf/meta/llama-3.2-3b-instruct', {
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        {
+          role: 'user',
+          content: `使用者訊息：${text}`,
+        },
+      ],
+    });
+  } catch {
+    return fallback(text, nowIso);
+  }
 
   const resp = response as Record<string, unknown>;
 
@@ -58,14 +57,15 @@ export async function classify(
       ? resp.response
       : (resp as { choices?: { message?: { content?: string } }[] }).choices?.[0]?.message?.content ?? '';
     const jsonMatch = String(raw).match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return fallback(text);
-    parsed = JSON.parse(jsonMatch[0]);
+    if (!jsonMatch) return fallback(text, nowIso);
+    try {
+      parsed = JSON.parse(jsonMatch[0]);
+    } catch {
+      return fallback(text, nowIso);
+    }
   }
 
   try {
-    const rawRemindAt = parsed.remind_at ? String(parsed.remind_at) : null;
-    const rawDueAt = parsed.due_at ? String(parsed.due_at) : null;
-
     // 規則引擎優先於小模型自己填的重複欄位，中文的「每天/每週 + 次數」判斷比較穩定可靠。
     const repeatHint = parseRepeatHint(text);
     const repeat_freq: ClassificationResult['repeat_freq'] = repeatHint
@@ -79,26 +79,51 @@ export async function classify(
         ? parsed.repeat_count
         : null;
 
+    const timeIntent = parseTimeIntent(text, nowIso);
+    let remind_at: string | null = null;
+    let due_at: string | null = null;
+    let time_issue: string | null = null;
+    let type: ClassificationResult['type'] = ['task', 'goal', 'idea', 'reminder', 'inbox'].includes(String(parsed.type))
+      ? (String(parsed.type) as ClassificationResult['type'])
+      : 'inbox';
+    let confidence = typeof parsed.confidence === 'number' ? parsed.confidence : 0.5;
+
+    if (timeIntent.status === 'resolved') {
+      if (timeIntent.role === 'deadline') {
+        due_at = timeIntent.instant;
+        if (type === 'inbox' || type === 'reminder') type = 'task';
+      } else {
+        remind_at = timeIntent.instant;
+        type = 'reminder';
+      }
+      confidence = Math.max(confidence, 0.8);
+    } else if (timeIntent.status === 'ambiguous') {
+      time_issue = timeIntent.reason;
+      type = 'reminder';
+      confidence = Math.max(confidence, 0.8);
+    }
+
     return {
-      type: ['task', 'goal', 'idea', 'reminder', 'inbox'].includes(String(parsed.type))
-        ? (String(parsed.type) as ClassificationResult['type'])
-        : 'inbox',
+      type,
       title: String(parsed.title || text.slice(0, 30)),
-      content: String(parsed.content || text),
-      remind_at: applyFixedTimeOfDay(text, rawRemindAt),
-      due_at: applyFixedTimeOfDay(text, rawDueAt),
+      content: text,
+      remind_at,
+      due_at,
       tags: Array.isArray(parsed.tags) ? parsed.tags.map(String) : [],
-      confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.5,
+      confidence,
       repeat_freq,
       repeat_count,
+      time_issue,
     };
   } catch {
-    return fallback(text);
+    return fallback(text, nowIso);
   }
 }
 
-function fallback(text: string): ClassificationResult {
-  return {
+function fallback(text: string, nowIso = new Date().toISOString()): ClassificationResult {
+  const timeIntent = parseTimeIntent(text, nowIso);
+  const repeatHint = parseRepeatHint(text);
+  const result: ClassificationResult = {
     type: 'inbox',
     title: text.slice(0, 30),
     content: text,
@@ -106,7 +131,24 @@ function fallback(text: string): ClassificationResult {
     due_at: null,
     tags: [],
     confidence: 0,
-    repeat_freq: null,
-    repeat_count: null,
+    repeat_freq: repeatHint?.freq ?? null,
+    repeat_count: repeatHint?.count ?? null,
+    time_issue: null,
   };
+
+  if (timeIntent.status === 'resolved') {
+    if (timeIntent.role === 'deadline') {
+      result.type = 'task';
+      result.due_at = timeIntent.instant;
+    } else {
+      result.type = 'reminder';
+      result.remind_at = timeIntent.instant;
+    }
+    result.confidence = 0.8;
+  } else if (timeIntent.status === 'ambiguous') {
+    result.type = 'reminder';
+    result.confidence = 0.8;
+    result.time_issue = timeIntent.reason;
+  }
+  return result;
 }

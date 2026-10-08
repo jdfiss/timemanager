@@ -1,6 +1,8 @@
 import { Env, Item } from './types';
 import { sendMessage } from './telegram';
 import { completeItem } from './reminder';
+import { classify } from './classifier';
+import { formatTaipei } from './timeparse';
 
 const TYPE_EMOJI: Record<string, string> = {
   task: '✅',
@@ -13,7 +15,8 @@ const TYPE_EMOJI: Record<string, string> = {
 export async function handleCommand(
   env: Env,
   chatId: number,
-  text: string
+  text: string,
+  referenceIso = new Date().toISOString(),
 ): Promise<void> {
   const [cmd, ...args] = text.split(' ');
   const arg = args.join(' ').trim();
@@ -22,7 +25,7 @@ export async function handleCommand(
     case '/start':
       return start(env, chatId);
     case '/today':
-      return today(env, chatId);
+      return today(env, chatId, referenceIso);
     case '/all':
       return listAll(env, chatId);
     case '/tasks':
@@ -35,6 +38,8 @@ export async function handleCommand(
       return listByType(env, chatId, 'inbox');
     case '/reminders':
       return listByType(env, chatId, 'reminder');
+    case '/remind':
+      return setRemindTime(env, chatId, arg, referenceIso);
     case '/done':
       return markDone(env, chatId, arg);
     case '/remove':
@@ -74,6 +79,7 @@ async function help(env: Env, chatId: number): Promise<void> {
     '/ideas — 所有點子',
     '/inbox — 未分類項目',
     '/reminders — 待觸發提醒',
+    '/remind <編號> <時間> — 直接設定提醒時間，例如 /remind 5 明天下午3點',
     '/done <編號> — 標記完成（支援多個：/done 1 2 3）',
     '/remove <編號> — 刪除項目（支援多個：/remove 1,2,3）',
     '/clearall — 一鍵清除所有進行中項目',
@@ -81,7 +87,7 @@ async function help(env: Env, chatId: number): Promise<void> {
     '/rules — 查看分類規則',
     '/help — 顯示此訊息',
     '',
-    '⏰ 時間到了會跳出「完成／延期一天／刪除」按鈕，不會默默消失。',
+    '⏰ 時間到了會跳出「完成／刪除」按鈕；沒按就當作沒完成，隔天早上自動排入當天。',
     '🔁 說「每天早上8點提醒我吃藥，共10次」這種也可以，會自動重複提醒。',
   ].join('\n');
   await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, msg);
@@ -119,17 +125,24 @@ async function rules(env: Env, chatId: number): Promise<void> {
     '「每天早上8點提醒我吃藥，共10次」「每週一晚上提醒倒垃圾，提醒到我完成為止」',
     '',
     '⚠️ *不會讓事項溜走*：時間一到，不論 task/goal/reminder 都會跳出',
-    '「✅ 完成／📅 延期一天／🗑 刪除」按鈕，你沒回應它就一直留著（/all、/reminders 等清單都看得到）。',
+    '「✅ 完成／🗑 刪除」按鈕；沒按就當作沒完成，隔天早上 07:00 自動排入當天同一時間。',
   ].join('\n');
   await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, msg);
 }
 
-async function today(env: Env, chatId: number): Promise<void> {
-  const todayStr = new Date().toISOString().slice(0, 10);
+async function today(env: Env, chatId: number, referenceIso: string): Promise<void> {
+  const reference = new Date(referenceIso);
+  const taipei = new Date(reference.getTime() + 8 * 60 * 60 * 1000);
+  const start = new Date(Date.UTC(
+    taipei.getUTCFullYear(),
+    taipei.getUTCMonth(),
+    taipei.getUTCDate(),
+  ) - 8 * 60 * 60 * 1000);
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
   const { results } = await env.DB.prepare(
-    `SELECT * FROM items WHERE date(created_at) = ? ORDER BY created_at DESC`
+    `SELECT * FROM items WHERE created_at >= ? AND created_at < ? ORDER BY created_at DESC`
   )
-    .bind(todayStr)
+    .bind(start.toISOString(), end.toISOString())
     .all<Item>();
 
   if (!results.length) {
@@ -174,6 +187,42 @@ async function markDone(env: Env, chatId: number, idStr: string): Promise<void> 
   const parts: string[] = [...messages];
   if (notFound.length) parts.push(`⚠️ 找不到：${notFound.map(i => `#${i}`).join(' ')}`);
   await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, parts.join('\n'));
+}
+
+async function setRemindTime(
+  env: Env,
+  chatId: number,
+  arg: string,
+  referenceIso: string,
+): Promise<void> {
+  const spaceIdx = arg.indexOf(' ');
+  const idStr = spaceIdx === -1 ? arg : arg.slice(0, spaceIdx);
+  const timeText = spaceIdx === -1 ? '' : arg.slice(spaceIdx + 1).trim();
+  const id = parseInt(idStr, 10);
+
+  if (isNaN(id) || !timeText) {
+    return sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, '請提供編號和時間，例如 /remind 5 明天下午3點');
+  }
+
+  const item = await env.DB.prepare(
+    `SELECT id FROM items WHERE id = ? AND status != 'done'`
+  ).bind(id).first<{ id: number }>();
+  if (!item) {
+    return sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `找不到進行中的項目 #${id}`);
+  }
+
+  const parsed = await classify(env, timeText, referenceIso);
+  const remindAt = parsed.remind_at ?? parsed.due_at;
+  if (!remindAt) {
+    const reason = parsed.time_issue ? `（${parsed.time_issue}）` : '';
+    return sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `看不懂「${timeText}」這個時間${reason}，換個講法試試，例如「明天下午3點」「週五早上」`);
+  }
+
+  await env.DB.prepare(
+    `UPDATE items SET remind_at = ?, status = 'active', notified_at = NULL WHERE id = ?`
+  ).bind(remindAt, id).run();
+
+  await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `⏰ #${id} 已設定，將在 ${formatTaipei(remindAt)} 提醒你`);
 }
 
 async function remove(env: Env, chatId: number, idStr: string): Promise<void> {

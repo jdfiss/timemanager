@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "db:migrate": "wrangler d1 migrations apply personal-agent-db"
+    "db:migrate": "wrangler d1 migrations apply personal-agent-db",
+    "test": "node --test --experimental-strip-types tests/*.test.mjs tests/*.test.cjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260914.1",

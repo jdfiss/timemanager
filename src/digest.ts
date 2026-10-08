@@ -1,9 +1,13 @@
 import { Env, Item } from './types';
 import { sendMessage } from './telegram';
+import { rolloverUnfinished } from './reminder';
+import { formatTaipei } from './timeparse';
 
 const TYPE_EMOJI: Record<string, string> = {
   task: '✅', goal: '🎯', idea: '💡', reminder: '🔔', inbox: '📥',
 };
+
+const MAX_ITEM_MESSAGES = 30;
 
 const SLOTS = [
   { name: 'morning', hour: 7, greeting: '🌅 早安！以下是你目前的待辦事項：' },
@@ -31,7 +35,9 @@ export async function checkDigest(env: Env): Promise<void> {
 
     if (row?.last_sent_date === dateStr) continue;
 
-    await sendDigest(env, slot.greeting);
+    // 早上先把之前沒完成的排進今天，再列今日清單
+    const rolled = slot.name === 'morning' ? await rolloverUnfinished(env, dateStr) : [];
+    await sendDigest(env, slot.greeting, new Set(rolled.map(i => i.id)));
 
     await env.DB.prepare(
       `INSERT INTO digest_log (slot, last_sent_date) VALUES (?, ?)
@@ -40,7 +46,7 @@ export async function checkDigest(env: Env): Promise<void> {
   }
 }
 
-async function sendDigest(env: Env, greeting: string): Promise<void> {
+async function sendDigest(env: Env, greeting: string, rolledIds: Set<number>): Promise<void> {
   const chatId = parseInt(env.ALLOWED_USER_ID, 10);
   if (!chatId) return;
 
@@ -67,8 +73,11 @@ async function sendDigest(env: Env, greeting: string): Promise<void> {
     const emoji = TYPE_EMOJI[type] || '📄';
     const lines = items.map(i => {
       let line = `  ${emoji} ${i.title || '(無標題)'}`;
+      if (rolledIds.has(i.id)) {
+        line += ` ↪️ 之前沒完成，排入今天 ${formatTaipei((i.remind_at ?? i.due_at)!).slice(6)}`;
+      }
       if (i.status === 'notified') {
-        line += ' ⏳ 待你選擇（完成／延期／刪除）';
+        line += ' ⏳ 還沒完成';
       }
       if (type === 'goal' && i.due_at) {
         const days = daysRemaining(i.due_at);
@@ -87,6 +96,32 @@ async function sendDigest(env: Env, greeting: string): Promise<void> {
 
   const msg = `${greeting}\n\n${sections.join('\n\n')}\n\n共 ${results.length} 項`;
   await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, msg);
+
+  // 統整訊息之後，逐項各發一則附按鈕，讓每一項都能直接處理。
+  // Workers 單次執行對外請求有上限（免費版 50），超過的項目只提示數量。
+  let sent = 0;
+  for (const [type, items] of sortedEntries) {
+    const emoji = TYPE_EMOJI[type] || '📄';
+    for (const i of items) {
+      if (sent >= MAX_ITEM_MESSAGES) break;
+      sent++;
+      const at = i.remind_at ?? i.due_at;
+      const text = `${emoji} #${i.id} ${i.title || '(無標題)'}${at ? `
+🕒 ${formatTaipei(at)}` : ''}`;
+      // 不需要延期按鈕：沒按完成就當作沒完成，隔天早上會自動排入
+      await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, text, [[
+        { text: '✅ 完成', callback_data: `done:${i.id}` },
+        { text: '🗑 刪除', callback_data: `delete:${i.id}` },
+      ]]);
+    }
+  }
+  if (results.length > sent) {
+    await sendMessage(
+      env.TELEGRAM_BOT_TOKEN,
+      chatId,
+      `還有 ${results.length - sent} 項沒附按鈕，用 /all 查看，或 /done <編號>、/remove <編號> 處理`
+    );
+  }
 }
 
 function daysRemaining(dueAt: string): number {
