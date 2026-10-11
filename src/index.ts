@@ -7,6 +7,7 @@ import { checkReminders, completeItem, postponeItem } from './reminder';
 import { checkDigest } from './digest';
 import { findSimilarItems, formatSimilarHint } from './similar';
 import { formatTaipei } from './timeparse';
+import { shouldIgnoreGroupMessage } from './group-routing';
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -62,6 +63,12 @@ export default {
     }
 
     const chatId = message.chat.id;
+    if ((message.chat.type === 'group' || message.chat.type === 'supergroup')
+      && message.text.trim() === '/chatid') {
+      await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `群組 ID：${chatId}`);
+      return new Response('ok');
+    }
+    if (shouldIgnoreGroupMessage(message, env.GROUP_CHAT_ID)) return new Response('ok');
     const text = message.text.trim();
     const messageTime = new Date(message.date * 1000).toISOString();
 
@@ -208,10 +215,10 @@ async function processMessage(
   const messageTime = new Date(messageDateSeconds * 1000).toISOString();
 
   const rawResult = await env.DB.prepare(
-    `INSERT INTO raw_messages (telegram_message_id, user_id, raw_text, created_at, processing_status)
-     VALUES (?, ?, ?, ?, 'pending')`
+    `INSERT INTO raw_messages (telegram_message_id, user_id, chat_id, raw_text, created_at, processing_status)
+     VALUES (?, ?, ?, ?, ?, 'pending')`
   )
-    .bind(messageId, userId, text, messageTime)
+    .bind(messageId, userId, chatId, text, messageTime)
     .run();
 
   const rawId = rawResult.meta.last_row_id;

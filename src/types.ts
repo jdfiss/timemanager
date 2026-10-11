@@ -4,6 +4,8 @@ export interface Env {
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_WEBHOOK_SECRET: string;
   ALLOWED_USER_ID: string;
+  GROUP_CHAT_ID?: string;
+  GOOGLE_CALENDAR_ICS_URL?: string;
 }
 
 export interface TelegramUpdate {
@@ -22,8 +24,9 @@ export interface TelegramCallbackQuery {
 export interface TelegramMessage {
   message_id: number;
   from?: { id: number; first_name: string };
-  chat: { id: number };
+  chat: { id: number; type?: string };
   text?: string;
+  entities?: Array<{ type: string; offset: number; length: number }>;
   date: number;
 }
 

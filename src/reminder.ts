@@ -160,10 +160,10 @@ async function getChatId(env: Env, rawMessageId: number | null): Promise<number 
   if (!rawMessageId) return parseInt(env.ALLOWED_USER_ID, 10) || null;
 
   const row = await env.DB.prepare(
-    `SELECT user_id FROM raw_messages WHERE id = ?`
+    `SELECT COALESCE(chat_id, user_id) AS chat_id FROM raw_messages WHERE id = ?`
   )
     .bind(rawMessageId)
-    .first<{ user_id: number }>();
+    .first<{ chat_id: number }>();
 
-  return row?.user_id ?? parseInt(env.ALLOWED_USER_ID, 10) ?? null;
+  return row?.chat_id ?? parseInt(env.ALLOWED_USER_ID, 10) ?? null;
 }

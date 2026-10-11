@@ -2,6 +2,7 @@ import { Env, Item } from './types';
 import { sendMessage } from './telegram';
 import { rolloverUnfinished } from './reminder';
 import { formatTaipei } from './timeparse';
+import { getTodayCalendar } from './calendar';
 
 const TYPE_EMOJI: Record<string, string> = {
   task: '✅', goal: '🎯', idea: '💡', reminder: '🔔', inbox: '📥',
@@ -37,7 +38,7 @@ export async function checkDigest(env: Env): Promise<void> {
 
     // 早上先把之前沒完成的排進今天，再列今日清單
     const rolled = slot.name === 'morning' ? await rolloverUnfinished(env, dateStr) : [];
-    await sendDigest(env, slot.greeting, new Set(rolled.map(i => i.id)));
+    await sendDigest(env, slot.greeting, new Set(rolled.map(i => i.id)), slot.name === 'morning' ? dateStr : undefined);
 
     await env.DB.prepare(
       `INSERT INTO digest_log (slot, last_sent_date) VALUES (?, ?)
@@ -46,7 +47,7 @@ export async function checkDigest(env: Env): Promise<void> {
   }
 }
 
-async function sendDigest(env: Env, greeting: string, rolledIds: Set<number>): Promise<void> {
+async function sendDigest(env: Env, greeting: string, rolledIds: Set<number>, dateStr?: string): Promise<void> {
   const chatId = parseInt(env.ALLOWED_USER_ID, 10);
   if (!chatId) return;
 
@@ -54,8 +55,18 @@ async function sendDigest(env: Env, greeting: string, rolledIds: Set<number>): P
     `SELECT * FROM items WHERE status IN ('active', 'notified') ORDER BY type, created_at DESC`
   ).all<Item>();
 
+  let calendarSection = '';
+  if (dateStr && env.GOOGLE_CALENDAR_ICS_URL) {
+    try {
+      calendarSection = await getTodayCalendar(env.GOOGLE_CALENDAR_ICS_URL, dateStr);
+    } catch {
+      console.warn('Morning calendar fetch failed');
+      calendarSection = '📅 今日行程暫時無法讀取';
+    }
+  }
   if (!results.length) {
-    await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, `${greeting}\n\n沒有進行中的事項 🎉`);
+    const message = `${greeting}\n\n沒有進行中的事項 🎉`;
+    await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, calendarSection ? message + '\n\n' + calendarSection : message);
     return;
   }
 
@@ -95,7 +106,12 @@ async function sendDigest(env: Env, greeting: string, rolledIds: Set<number>): P
   });
 
   const msg = `${greeting}\n\n${sections.join('\n\n')}\n\n共 ${results.length} 項`;
-  await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, msg);
+  if (calendarSection && msg.length + calendarSection.length + 2 <= 3900) {
+    await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, msg + '\n\n' + calendarSection);
+  } else {
+    await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, msg);
+    if (calendarSection) await sendMessage(env.TELEGRAM_BOT_TOKEN, chatId, calendarSection);
+  }
 
   // 統整訊息之後，逐項各發一則附按鈕，讓每一項都能直接處理。
   // Workers 單次執行對外請求有上限（免費版 50），超過的項目只提示數量。
